@@ -102,7 +102,12 @@ class Detector: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
   }
  }
 }
-guard AVCaptureDevice.authorizationStatus(for: .video) == .authorized else { fatalError("Camera permission required") }
+if AVCaptureDevice.authorizationStatus(for: .video) == .notDetermined {
+ let permission = DispatchSemaphore(value: 0)
+ AVCaptureDevice.requestAccess(for: .video) { _ in permission.signal() }
+ permission.wait()
+}
+guard AVCaptureDevice.authorizationStatus(for: .video) == .authorized else { fatalError("Camera permission denied or restricted") }
 let device = AVCaptureDevice.DiscoverySession(deviceTypes:[.external],mediaType:.video,position:.unspecified).devices.first { $0.localizedName == "USB3.0 capture" }!
 let session = AVCaptureSession()
 session.beginConfiguration()

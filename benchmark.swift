@@ -8,6 +8,7 @@ let args = CommandLine.arguments
 let modelPath = args.count > 1 ? args[1] : "yolo11n-pose.mlpackage"
 let cropSize = args.count > 2 ? Double(args[2])! : 0
 let samples = args.count > 3 ? Int(args[3])! : 500
+guard samples >= 2 else { fatalError("At least two measured samples are required") }
 let tag = args.count > 4 ? args[4] : "run"
 let units = args.count > 5 ? args[5] : "all"
 let config = MLModelConfiguration()
@@ -35,6 +36,7 @@ class Detector: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
  var intervals = [Double](); var previous = 0.0
  var best = Double.infinity; var bestImage: CGImage?; var bestRow: [String: Any]?
  var completed = false
+ var failure: String?
  override init() {
   super.init()
   CVPixelBufferCreate(kCFAllocatorDefault,size,size,kCVPixelFormatType_32BGRA,[kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary,&buffer)
@@ -102,11 +104,16 @@ class Detector: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
     count += 1
     if count % 100 == 0 { print("\(tag) \(count) frames, \(kept.count) people, \((end-start)*1000) ms") }
     if rows.count >= samples { completed = true; done.signal() }
-   } catch { print("ERROR \(error)"); completed = true; done.signal() }
+   } catch { failure = String(describing:error); print("ERROR \(error)"); completed = true; done.signal() }
   }
  }
 }
-guard AVCaptureDevice.authorizationStatus(for: .video) == .authorized else { fatalError("Camera permission required") }
+if AVCaptureDevice.authorizationStatus(for: .video) == .notDetermined {
+ let permission = DispatchSemaphore(value: 0)
+ AVCaptureDevice.requestAccess(for: .video) { _ in permission.signal() }
+ permission.wait()
+}
+guard AVCaptureDevice.authorizationStatus(for: .video) == .authorized else { fatalError("Camera permission denied or restricted") }
 let device = AVCaptureDevice.DiscoverySession(deviceTypes:[.external],mediaType:.video,position:.unspecified).devices.first { $0.localizedName == "USB3.0 capture" }!
 let session = AVCaptureSession()
 session.beginConfiguration()
@@ -129,10 +136,12 @@ device.unlockForConfiguration()
 print("CAPTURE actual format \(CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription)) duration \(device.activeVideoMinFrameDuration)")
 let status = done.wait(timeout:.now()+120)
 session.stopRunning()
-let metadata: [String: Any] = ["model":modelPath,"model_size":size,"crop":cropSize,"compute_units":units,"warmup":30,"samples":detector.rows.count,"dropped_callbacks":detector.dropped,"status":"\(status)","requested_fps":range.maxFrameRate,"rows":detector.rows]
+let resultStatus = detector.failure != nil ? "failed" : status == .timedOut || detector.rows.count < samples ? "timed_out" : "completed"
+let metadata: [String: Any] = ["model":modelPath,"model_size":size,"crop":cropSize,"compute_units":units,"warmup":30,"requested_samples":samples,"samples":detector.rows.count,"dropped_callbacks":detector.dropped,"status":resultStatus,"error":detector.failure ?? "","requested_fps":range.maxFrameRate,"rows":detector.rows]
 try JSONSerialization.data(withJSONObject:metadata,options:[.prettyPrinted,.sortedKeys]).write(to:URL(fileURLWithPath:"results/\(tag).json"))
 if let cg = detector.bestImage {
  try NSBitmapImageRep(cgImage:cg).representation(using:.png,properties:[:])!.write(to:URL(fileURLWithPath:"results/\(tag)-best.png"))
  try JSONSerialization.data(withJSONObject:detector.bestRow!,options:[.prettyPrinted,.sortedKeys]).write(to:URL(fileURLWithPath:"results/\(tag)-best.json"))
 }
 print("FINISHED \(tag) samples \(detector.rows.count), dropped \(detector.dropped)")
+if resultStatus != "completed" { exit(1) }

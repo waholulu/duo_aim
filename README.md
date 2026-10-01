@@ -11,7 +11,7 @@ swiftc -O benchmark.swift -o benchmark
 
 参数依次为：Core ML 模型路径、中心裁剪边长（0 表示全图）、预热后样本数、结果名称、计算设备（all/gpu/ane/cpu）。输入设备按名称 `USB3.0 capture` 选择。模型与 Python 依赖已在本目录，依赖版本见 `requirements-lock.txt`。
 
-每轮丢弃前 30 帧作为预热；结果写入 `results/<名称>.json`。检测到可信鼻尖时另外保存最快有效帧的 PNG 和 JSON。`summarize.py` 汇总指定实验；`annotate.py` 生成对应结果的坐标叠加图。
+每轮丢弃前 30 帧作为预热；结果写入 `results/<名称>.json`，包含完成、失败或超时状态及实际样本数。失败和超时会以非零状态退出。检测到可信鼻尖时另外保存最快有效帧的 PNG 和 JSON。`python summarize.py` 汇总 `results` 中已完成的实验，也可传入一个或多个结果 JSON；旧格式中无法确认完成状态的结果不会纳入汇总。`annotate.py` 生成对应结果的坐标叠加图。
 
 输入取 1920×1080，设备启动后设置最高可用帧率。必须在 `startRunning()` 后设置，否则此设备在此次测试中会被系统重置为 25 FPS。驱动宣称的 240.004 FPS 不等于实测处理帧率，更不代表信号源有同样多的独立画面。`alwaysDiscardsLateVideoFrames=true` 防止应用排队处理旧帧。同步推理在串行采集回调内完成。
 

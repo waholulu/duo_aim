@@ -1,6 +1,7 @@
 from ultralytics import YOLO
 import cv2
-im=cv2.imread('results/capture.png'); crop=im[60:1020,480:1440]
+from crop_utils import center_crop
+im=cv2.imread('results/capture.png'); crop=center_crop(im,960)
 for name in ['yolo26n-pose.pt','yolo11s-pose.pt']:
  m=YOLO(name)
  for s in [320,640]:

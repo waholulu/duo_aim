@@ -32,11 +32,15 @@ class UDPOutput:
         if len(self.key)<32:raise ValueError('远程模式需要两端设置同一个至少32字符的 AIM_TOKEN。')
         self.sock=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
         self.dest=(host,port);self.seq=0;self.session=str(uuid.uuid4())
-    def move(self,dx,dy):
+    def send(self,kind,dx=0,dy=0,ttl_ms=80):
         self.seq+=1
-        payload=json.dumps(dict(session=self.session,seq=self.seq,ts=time.time(),dx=dx,dy=dy),separators=(',',':')).encode()
+        payload=json.dumps(dict(session=self.session,seq=self.seq,ts=time.time(),kind=kind,ttl_ms=ttl_ms,dx=dx,dy=dy),separators=(',',':')).encode()
         packet=json.dumps(dict(payload=payload.decode(),mac=hmac.new(self.key,payload,hashlib.sha256).hexdigest())).encode()
         self.sock.sendto(packet,self.dest)
+    def move(self,dx,dy,ttl_ms=80):
+        self.send('move',dx,dy,ttl_ms)
+    def stop(self):
+        self.send('stop')
 
 def main():
     ap=argparse.ArgumentParser(description=__doc__)
@@ -56,20 +60,32 @@ def main():
     args=ap.parse_args()
     if not all(__import__('math').isfinite(v) for v in [args.gain_x,args.gain_y,args.radius,args.interval_ms,args.seconds]):ap.error('parameters must be finite')
     if args.max_step<1 or args.max_step>128 or args.radius<=0 or args.interval_ms<10 or args.seconds<0 or args.crop<0:ap.error('invalid bounds')
+    if args.backend=='udp' and args.max_step>32:ap.error('UDP receiver accepts at most 32 counts per axis; use --max-step 32 or less')
     if args.backend=='udp' and args.live and not args.host:ap.error('--host required for live udp')
     if args.backend=='udp' and args.activation!='auto':
         print('远端是否按住右键由 Windows 接收器判断；Mac 端持续发送检测到的有效偏移。',flush=True)
     binary=ROOT/'aim/detector';source=ROOT/'aim/detector.swift'
     if not binary.exists() or binary.stat().st_mtime<source.stat().st_mtime:
         subprocess.run(['swiftc','-O',str(source),'-o',str(binary)],check=True)
-    mouse=MacMouse(args.live) if args.backend=='mac' and args.live else None
-    output=(mouse if args.backend=='mac' else UDPOutput(args.host,args.port)) if args.live else None
+    logdir=ROOT/'results';logdir.mkdir(exist_ok=True)
+    logpath=logdir/(time.strftime('aim-%Y%m%d-%H%M%S')+'.jsonl')
+    mouse=None;output=None
+    try:
+        mouse=MacMouse(args.live) if args.backend=='mac' and args.live else None
+        output=(mouse if args.backend=='mac' else UDPOutput(args.host,args.port)) if args.live else None
+        run_detector(args,mouse,output,logpath)
+    finally:
+        if isinstance(output,UDPOutput):output.sock.close()
+    print('Stopped. '+str(logpath))
+
+def run_detector(args,mouse,output,logpath):
+    binary=ROOT/'aim/detector'
     cfg=Settings(gain_x=args.gain_x,gain_y=args.gain_y,radius=args.radius,max_step=args.max_step,interval_ms=args.interval_ms)
     controller=Controller(cfg)
     # A single replaceable slot: never drain a backlog of obsolete detections.
     condition=threading.Condition();state={'frame':None,'closed':False,'error':None}
     cmd=[str(binary),str((ROOT/args.model).resolve()),str(args.crop),'0','stream','all']
-    proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,text=True,bufsize=1,start_new_session=True)
+    proc=None
     def reader():
         try:
             for line in proc.stdout:
@@ -80,12 +96,11 @@ def main():
             state['error']=str(e)
         finally:
             with condition:state['closed']=True;condition.notify()
-    threading.Thread(target=reader,daemon=True).start()
-    logdir=ROOT/'results';logdir.mkdir(exist_ok=True)
-    logpath=logdir/(time.strftime('aim-%Y%m%d-%H%M%S')+'.jsonl')
-    started=time.monotonic();last_print=0
-    print(f'{"LIVE" if args.live else "DRY RUN (鼠标不动)"} | backend={args.backend} | Ctrl+C结束 | log={logpath}',flush=True)
     try:
+        proc=subprocess.Popen(cmd,stdout=subprocess.PIPE,text=True,bufsize=1,start_new_session=True)
+        threading.Thread(target=reader,daemon=True).start()
+        started=time.monotonic();last_print=0
+        print(f'{"LIVE" if args.live else "DRY RUN (鼠标不动)"} | backend={args.backend} | Ctrl+C结束 | log={logpath}',flush=True)
         with logpath.open('w',buffering=65536) as log:
             while not args.seconds or time.monotonic()-started<args.seconds:
                 if mouse and mouse.escaped():break
@@ -102,7 +117,13 @@ def main():
                 if queue_age_ms < -5: raise RuntimeError('Host clock mismatch; refusing mouse output')
                 result=controller.step(frame,t,active,max(0,queue_age_ms))
                 result.update(frame=frame['index'],dry_run=not args.live,processing_ms=frame['callback_to_coords_ms'],pts_to_coords_ms=frame['pts_to_coords_ms'],pts_to_controller_ms=frame['pts_to_coords_ms']+max(0,queue_age_ms))
-                if result['reason']=='move' and output:output.move(result['dx'],result['dy'])
+                if isinstance(output,UDPOutput):
+                    if result['reason']=='move':
+                        ttl_ms=cfg.max_age_ms-result['pts_to_controller_ms']-(time.monotonic()-t)*1000
+                        if ttl_ms>0:output.move(result['dx'],result['dy'],ttl_ms)
+                        else:output.stop()
+                    elif result['reason'] in ('no_target','stale','inactive','aligned','confirming'):output.stop()
+                elif result['reason']=='move' and output:output.move(result['dx'],result['dy'])
                 log.write(json.dumps(result)+'\n')
                 if t-last_print>=.5:
                     print(json.dumps(result,ensure_ascii=False),flush=True);last_print=t
@@ -111,12 +132,10 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        if proc.poll() is None:
+        if proc is not None and proc.poll() is None:
             os.killpg(proc.pid,signal.SIGTERM)
             try:proc.wait(timeout=3)
             except subprocess.TimeoutExpired:os.killpg(proc.pid,signal.SIGKILL);proc.wait()
-        proc.stdout.close()
-        if isinstance(output,UDPOutput):output.sock.close()
-    print('Stopped. '+str(logpath))
+        if proc is not None and proc.stdout is not None:proc.stdout.close()
 
 if __name__=='__main__':main()
