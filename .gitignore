@@ -1,0 +1,15 @@
+.venv/
+*.mlpackage/
+*.mlmodelc/
+*.pt
+benchmark
+capture_probe
+__pycache__/
+
+aim/detector
+results/
+.DS_Store
+*.pyc
+.env
+.env.*
+!.env.example
