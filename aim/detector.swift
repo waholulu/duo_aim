@@ -1,129 +1,142 @@
 import AVFoundation
 import AppKit
-import CoreML
 import Foundation
 
-func now() -> Double { CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock())) }
-let args = CommandLine.arguments
-let modelPath = args.count > 1 ? args[1] : "yolo11n-pose.mlpackage"
-let cropSize = args.count > 2 ? Double(args[2])! : 0
-let samples = args.count > 3 ? Int(args[3])! : 0
-let tag = args.count > 4 ? args[4] : "run"
-let units = args.count > 5 ? args[5] : "all"
-let config = MLModelConfiguration()
-config.computeUnits = units == "cpu" ? .cpuOnly : units == "gpu" ? .cpuAndGPU : units == "ane" ? .cpuAndNeuralEngine : .all
-let compiled = try MLModel.compileModel(at: URL(fileURLWithPath: modelPath))
-let model = try MLModel(contentsOf: compiled, configuration: config)
-let inputName = model.modelDescription.inputDescriptionsByName.keys.first!
-let size = model.modelDescription.inputDescriptionsByName[inputName]!.imageConstraint!.pixelsWide
-fputs("Model ready: \(size) px\n", stderr)
-let done = DispatchSemaphore(value: 0)
-struct Detection {
- var x: Double; var y: Double; var w: Double; var h: Double; var conf: Double
- var hx: Double; var hy: Double; var hc: Double
-}
-func iou(_ a: Detection, _ b: Detection) -> Double {
- let w = max(0, min(a.x+a.w/2,b.x+b.w/2)-max(a.x-a.w/2,b.x-b.w/2))
- let h = max(0, min(a.y+a.h/2,b.y+b.h/2)-max(a.y-a.h/2,b.y-b.h/2))
- return w*h / max(1e-9,a.w*a.h+b.w*b.h-w*h)
-}
-class Detector: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
- let context = CIContext(options: [.cacheIntermediates: false])
- var buffer: CVPixelBuffer!
- var count = 0; var dropped = 0
- var measured = 0
+final class InferenceGate {
+    private let lock = NSLock()
+    private var active = false
+    private var epoch = 0
 
-
- var completed = false
- var failed = false
- override init() {
-  super.init()
-  CVPixelBufferCreate(kCFAllocatorDefault,size,size,kCVPixelFormatType_32BGRA,[kCVPixelBufferIOSurfacePropertiesKey: [:]] as CFDictionary,&buffer)
- }
- func captureOutput(_ output: AVCaptureOutput, didDrop sb: CMSampleBuffer, from connection: AVCaptureConnection) { dropped += 1 }
- func captureOutput(_ output: AVCaptureOutput, didOutput sb: CMSampleBuffer, from connection: AVCaptureConnection) {
-  if completed { return }
-  autoreleasepool {
-   let start = now()
-
-   guard let pb = CMSampleBufferGetImageBuffer(sb) else { return }
-   let width = Double(CVPixelBufferGetWidth(pb)), height = Double(CVPixelBufferGetHeight(pb))
-   let cw = cropSize > 0 ? min(cropSize,width) : width
-   let ch = cropSize > 0 ? min(cropSize,height) : height
-   let ox = (width-cw)/2, oy = (height-ch)/2
-   let scale = Double(size)/max(cw,ch)
-   let px = (Double(size)-cw*scale)/2, py = (Double(size)-ch*scale)/2
-   let original = CIImage(cvPixelBuffer: pb)
-   let cropped = original.cropped(to: CGRect(x:ox,y:oy,width:cw,height:ch)).transformed(by:CGAffineTransform(translationX:-ox,y:-oy)).transformed(by:CGAffineTransform(scaleX:scale,y:scale)).transformed(by:CGAffineTransform(translationX:px,y:py))
-   let bg = CIImage(color: CIColor(red:114/255,green:114/255,blue:114/255)).cropped(to:CGRect(x:0,y:0,width:size,height:size))
-   context.render(cropped.composited(over:bg),to:buffer)
-   let prep = now()
-   do {
-    let input = try MLDictionaryFeatureProvider(dictionary:[inputName: MLFeatureValue(pixelBuffer:buffer)])
-    let prediction = try model.prediction(from:input)
-    let infer = now()
-    let arr = prediction.featureValue(for:prediction.featureNames.first!)!.multiArrayValue!
-    guard arr.dataType == .float32, arr.shape.count == 3, arr.shape[1].intValue == 56 else { throw NSError(domain:"Unsupported YOLO output",code:1) }
-    let n = arr.shape[2].intValue
-    let s1 = arr.strides[1].intValue, s2 = arr.strides[2].intValue
-    let values = arr.dataPointer.bindMemory(to: Float.self, capacity: arr.count)
-    func val(_ c: Int,_ j: Int) -> Double { Double(values[c*s1+j*s2]) }
-    var candidates = [Detection]()
-    for j in 0..<n where val(4,j) >= 0.25 {
-     candidates.append(Detection(x:val(0,j),y:val(1,j),w:val(2,j),h:val(3,j),conf:val(4,j),hx:val(5,j),hy:val(6,j),hc:val(7,j)))
+    func set(_ active: Bool, epoch: Int) {
+        lock.lock(); defer { lock.unlock() }
+        self.active = active; self.epoch = epoch
     }
-    candidates.sort { $0.conf > $1.conf }
-    var kept = [Detection]()
-    for d in candidates { if !kept.contains(where:{ iou(d,$0)>0.45 }) { kept.append(d) } }
-    let detections: [[String: Any]] = kept.map { d in
-     ["confidence": d.conf, "head_confidence": d.hc,
-      "head_xy": [(d.hx-px)/scale+ox,(d.hy-py)/scale+oy],
-      "person_center": [(d.x-px)/scale+ox,(d.y-py)/scale+oy],
-      "bbox_xyxy": [(d.x-d.w/2-px)/scale+ox,(d.y-d.h/2-py)/scale+oy,(d.x+d.w/2-px)/scale+ox,(d.y+d.h/2-py)/scale+oy]]
+    func snapshot() -> (Bool, Int) {
+        lock.lock(); defer { lock.unlock() }
+        return (active, epoch)
     }
-    var row: [String: Any] = ["index":count,"width":Int(width),"height":Int(height),"detections":detections]
-    let end = now(), pts = CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sb))
-    row["callback_to_coords_ms"] = (end-start)*1000
-    row["preprocess_ms"] = (prep-start)*1000
-    row["inference_ms"] = (infer-prep)*1000
-    row["postprocess_ms"] = (end-infer)*1000
-    row["pts_to_callback_ms"] = (start-pts)*1000
-    row["pts_to_coords_ms"] = (end-pts)*1000
-    row["host_start_s"] = start; row["pts_s"] = pts
-    if count >= 30 {
-     measured += 1
-     let data = try JSONSerialization.data(withJSONObject:row)
-     FileHandle.standardOutput.write(data)
-     FileHandle.standardOutput.write(Data([10]))
-    }
-    count += 1
-    if samples > 0 && measured >= samples { completed = true; done.signal() }
-   } catch { fputs("Detector error: \(error)\n", stderr); failed = true; completed = true; done.signal() }
-  }
- }
 }
-guard AVCaptureDevice.authorizationStatus(for: .video) == .authorized else { fatalError("Camera permission required") }
-let device = AVCaptureDevice.DiscoverySession(deviceTypes:[.external],mediaType:.video,position:.unspecified).devices.first { $0.localizedName == "USB3.0 capture" }!
-let session = AVCaptureSession()
-session.beginConfiguration()
-session.addInput(try AVCaptureDeviceInput(device:device))
-let output = AVCaptureVideoDataOutput()
-output.videoSettings = [kCVPixelBufferPixelFormatTypeKey as String:kCVPixelFormatType_32BGRA]
-output.alwaysDiscardsLateVideoFrames = true
-let detector = Detector()
-output.setSampleBufferDelegate(detector,queue:DispatchQueue(label:"capture.inference",qos:.userInteractive))
-session.addOutput(output)
-session.commitConfiguration()
-session.startRunning()
-try device.lockForConfiguration()
-let formats = device.formats.filter { let d = CMVideoFormatDescriptionGetDimensions($0.formatDescription); return d.width==1920 && d.height==1080 }
-device.activeFormat = formats.max { $0.videoSupportedFrameRateRanges.map(\.maxFrameRate).max()! < $1.videoSupportedFrameRateRanges.map(\.maxFrameRate).max()! }!
-let range = device.activeFormat.videoSupportedFrameRateRanges.max { $0.maxFrameRate < $1.maxFrameRate }!
-device.activeVideoMinFrameDuration = range.minFrameDuration
-device.activeVideoMaxFrameDuration = range.minFrameDuration
-device.unlockForConfiguration()
-fputs("Capture ready; mode=\(device.activeFormat.formatDescription)\n",stderr)
-if samples > 0 { _ = done.wait(timeout:.now()+120) } else { done.wait() }
-session.stopRunning()
 
-if detector.failed { exit(1) }
+func emit(_ event: [String: Any]) throws {
+    var row = event
+    row["protocol_version"] = 1
+    var data = try JSONSerialization.data(withJSONObject:row)
+    data.append(10)
+    try FileHandle.standardOutput.write(contentsOf:data)
+}
+
+final class StreamDetector: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
+    let vision: VisionCore
+    let crop: Double
+    let gate: InferenceGate
+    let samples: Int
+    let done = DispatchSemaphore(value:0)
+    var started = false // Accessed only on capture queue.
+    var count = 0
+    var warmup = 0
+    var measured = 0
+    var failed = false
+    var completed = false
+    var lastFrameSize: [Int] = []
+    let diagnosticPath = ProcessInfo.processInfo.environment["AIM_DIAGNOSTIC_FRAME"]
+
+    init(vision: VisionCore, crop: Double, gate: InferenceGate, samples: Int) {
+        self.vision = vision; self.crop = crop; self.gate = gate; self.samples = samples
+    }
+
+    func captureOutput(_ output: AVCaptureOutput, didOutput sample: CMSampleBuffer,
+                       from connection: AVCaptureConnection) {
+        guard started, !completed else { return }
+        let start = hostNow()
+        let index = count; count += 1
+        let (active, epoch) = gate.snapshot()
+        guard let buffer = CMSampleBufferGetImageBuffer(sample) else { return }
+        let dimensions = [CVPixelBufferGetWidth(buffer), CVPixelBufferGetHeight(buffer)]
+        if dimensions != lastFrameSize {
+            lastFrameSize = dimensions
+            let geometry = Geometry(width:Double(dimensions[0]), height:Double(dimensions[1]), crop:crop, size:vision.size)
+            fputs("Capture geometry: frame=\(dimensions), crop=\(geometry.cropXYWH)\n", stderr)
+        }
+        guard active else { return }
+        autoreleasepool {
+            do {
+                let result = try vision.infer(buffer, crop:crop, start:start)
+                if warmup < 30 {
+                    warmup += 1
+                    try emit(["type":"warmup", "gate_epoch":epoch, "completed":warmup, "total":30])
+                    return
+                }
+                let g = result.geometry
+                var row: [String: Any] = ["type":"frame", "index":index, "gate_epoch":epoch,
+                    "width":Int(g.width), "height":Int(g.height), "crop_xywh":g.cropXYWH,
+                    "detections":result.detections.map { $0.mapped(g) }]
+                row.merge(result.timings(pts:CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sample)))) { _, new in new }
+                if measured == 0, let path = diagnosticPath,
+                   let image = vision.context.createCGImage(result.original, from:result.original.extent),
+                   let png = NSBitmapImageRep(cgImage:image).representation(using:.png, properties:[:]) {
+                    try png.write(to:URL(fileURLWithPath:path))
+                    try JSONSerialization.data(withJSONObject:row, options:[.prettyPrinted, .sortedKeys])
+                        .write(to:URL(fileURLWithPath:path + ".json"))
+                }
+                try emit(row)
+                measured += 1
+                if samples > 0 && measured >= samples { completed = true; done.signal() }
+            } catch {
+                fputs("Detector error: \(error)\n", stderr)
+                failed = true; completed = true; done.signal()
+            }
+        }
+    }
+}
+
+@main
+struct DetectorMain {
+    static func main() {
+        do { try run() }
+        catch { fputs("Detector error: \(error)\n", stderr); exit(1) }
+    }
+    static func run() throws {
+        let args = CommandLine.arguments
+        let path = args.count > 1 ? args[1] : "yolo11n-pose.mlpackage"
+        let crop = args.count > 2 ? Double(args[2]) ?? -1 : 0
+        let samples = args.count > 3 ? Int(args[3]) ?? -1 : 0
+        let units = args.count > 5 ? args[5] : "all"
+        let gated = args.count > 6 && args[6] == "gated"
+        guard crop.isFinite, crop >= 0, samples >= 0, ["all", "cpu", "gpu", "ane"].contains(units) else {
+            throw VisionError("Invalid detector arguments")
+        }
+        let vision = try VisionCore(path:path, units:units)
+        let gate = InferenceGate()
+        let detector = StreamDetector(vision:vision, crop:crop, gate:gate, samples:samples)
+        if gated {
+            DispatchQueue.global(qos:.userInteractive).async {
+                while let line = readLine() {
+                    let fields = line.split(separator:" ")
+                    if fields.count == 2, let epoch = Int(fields[1]), epoch >= 0,
+                       fields[0] == "0" || fields[0] == "1" {
+                        gate.set(fields[0] == "1", epoch:epoch)
+                    }
+                }
+                gate.set(false, epoch:-1)
+                detector.done.signal() // Parent gone: release capture instead of waiting forever.
+            }
+        } else { gate.set(true, epoch:0) }
+        let queue = DispatchQueue(label:"capture.inference", qos:.userInteractive)
+        let (session, fps) = try startCapture(delegate:detector, queue:queue)
+        defer { session.stopRunning() }
+        // Serialize readiness before the first result, after capture configuration.
+        try queue.sync {
+            try emit(["type":"ready", "model_size":vision.size, "warmup_total":30, "requested_fps":fps])
+            detector.started = true
+        }
+        if samples > 0 {
+            guard detector.done.wait(timeout:.now()+120) == .success else {
+                throw VisionError("Timed out waiting for requested samples")
+            }
+        } else { detector.done.wait() }
+        session.stopRunning()
+        let (failed, measured) = queue.sync { (detector.failed, detector.measured) }
+        if failed { throw VisionError("Inference stopped") }
+        if samples > 0 && measured < samples { throw VisionError("Control input closed before requested samples completed") }
+    }
+}

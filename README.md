@@ -5,13 +5,13 @@
 ## 运行
 
 ```sh
-swiftc -O benchmark.swift -o benchmark
+swiftc -O aim/VisionCore.swift benchmark.swift -o benchmark
 ./benchmark yolo11n-pose-320-fp16.mlpackage 960 1000 my-run all
 ```
 
 参数依次为：Core ML 模型路径、中心裁剪边长（0 表示全图）、预热后样本数、结果名称、计算设备（all/gpu/ane/cpu）。输入设备按名称 `USB3.0 capture` 选择。模型与 Python 依赖已在本目录，依赖版本见 `requirements-lock.txt`。
 
-每轮丢弃前 30 帧作为预热；结果写入 `results/<名称>.json`。检测到可信鼻尖时另外保存最快有效帧的 PNG 和 JSON。`summarize.py` 汇总指定实验；`annotate.py` 生成对应结果的坐标叠加图。
+每轮丢弃前 30 帧作为预热；结果写入 `results/<名称>.json`。检测到可信鼻尖时另外保存最快有效帧的 PNG 和 JSON。`summarize.py results/my-run.json` 汇总指定实验；`annotate.py results/my-run-best.json` 生成对应结果的坐标叠加图。
 
 输入取 1920×1080，设备启动后设置最高可用帧率。必须在 `startRunning()` 后设置，否则此设备在此次测试中会被系统重置为 25 FPS。驱动宣称的 240.004 FPS 不等于实测处理帧率，更不代表信号源有同样多的独立画面。`alwaysDiscardsLateVideoFrames=true` 防止应用排队处理旧帧。同步推理在串行采集回调内完成。
 
@@ -30,9 +30,15 @@ YOLO11n-pose 提供人框和 COCO 人体关键点。按人框中心到图像中�
 
 模型说明：[Ultralytics Pose](https://docs.ultralytics.com/tasks/pose/)，[Core ML 导出](https://docs.ultralytics.com/integrations/coreml/)。
 
-## 鼠标反馈脚本（明天测试）
+## 鼠标反馈脚本
 
-新脚本入口：`./start_aim.command`，默认只检测、不移动鼠标。控制Mac或另一台Windows电脑的启动方法、游戏灵敏度校准和已知限制见 [aim/README.md](aim/README.md)。原有延迟测量脚本保持独立。
+入口：`./start_aim.command`。默认通过 KMBox B+/B Pro 读取实体鼠标左键；仅按住左键时识别画面中心 960×960 像素。默认只记录建议移动，`--live` 才向 KMBox 发送相对移动。启动方法、参数和限制见 [aim/README.md](aim/README.md)。原有延迟测量脚本保持独立。
+
+## 快速检查视频和 KMBox
+
+双击 `check_devices.command`，或在项目目录执行 `./check_devices.command`。默认检查 3 秒，显示采集分辨率、收到的帧数、回调帧率、KMBox 固件信息和物理鼠标左键状态。需要更多时间点击鼠标时执行 `./check_devices.command --seconds 10`。此检查只查询设备，不启动 YOLO 或发送鼠标移动、点击。运行前先停止其他占用 KMBox 的控制脚本。
+
+可通过 `--serial-port /dev/cu.usbserial-120` 和 `--device 'USB3.0 capture'` 指定设备。两路检查独立进行，失败时仍会显示另一路的结果；最新记录保存到 `results/device-check.json`，任一路异常时退出码为 1。收到帧只能证明视频数据可获取，不能单独证明 HDMI 信号内容正确或画面持续变化。
 
 ## 从 GitHub 克隆后准备环境
 
@@ -55,4 +61,28 @@ PYTHON
 ./start_aim.command
 ```
 
-首次导出会下载模型；连接采集卡并授予摄像头访问权限后即可运行。默认只检测，不移动鼠标。
+首次导出会下载模型；连接采集卡和 KMBox、授予摄像头访问权限后即可运行。默认不移动鼠标，按住接在 KMBox 上的实体鼠标左键时才识别。
+
+## 共享视觉核心与验证
+
+`aim/VisionCore.swift` 是 benchmark 和流式检测器共用的裁剪、推理、张量解码、NMS 与坐标还原实现。模型契约为单个方形图像输入和单个 Float32 `[1,56,N]` 姿态输出；不支持的模型在加载时明确报错。两种入口的目标选择仍不同：benchmark 保留人框中心最近者和鼻尖置信度 0.5 的测量语义，运行策略另有目标半径、置信度、连续确认与位置连续性条件，不能直接将 benchmark 的有效头部数量当作实际控制成功率。
+
+```sh
+.venv/bin/python -m unittest discover -s tests
+mkdir -p results
+swiftc -O aim/VisionCore.swift tests/vision_tests.swift -o results/vision-tests
+./results/vision-tests
+# 可选：使用本地模型与合成图像验证推理，不打开设备
+./results/vision-tests yolo11n-pose-320-fp16.mlpackage yolo11n-pose-640-fp16.mlpackage
+```
+
+实验辅助工具现在接受明确输入路径：
+
+```sh
+.venv/bin/python summarize.py results/my-run.json --output results/my-summary.json
+.venv/bin/python annotate.py results/my-run-best.json
+.venv/bin/python validate.py results/capture.png --models yolo11n-pose.pt --crop 960
+.venv/bin/python check_models.py results/capture.png --models yolo11n-pose.pt yolo11s-pose.pt
+```
+
+`validate.py` 和 `check_models.py` 仅对指定图片运行参考推理，模型不存在时 Ultralytics 可能下载权重。`summarize.py` 拒绝 `INVALID-` 原型结果，空或单样本实验不会产生无效统计值。运行记录与手动标定见 [aim/README.md](aim/README.md)。

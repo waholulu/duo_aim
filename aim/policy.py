@@ -29,14 +29,20 @@ class Controller:
         self.previous = None
         self.streak = 0
 
-    def step(self, frame, now, active=True, queue_age_ms=0):
+    def commit_move(self, sent_at):
+        """Commit only a successful real or simulated send, using its start time."""
+        if not math.isfinite(sent_at) or sent_at < self.last_move:
+            raise ValueError('Invalid send timestamp')
+        self.last_move = sent_at
+
+    def step(self, frame, now, active=True, queue_age_ms=0, age_ms=None):
         c = self.cfg
         result = {'reason': 'no_target', 'dx': 0, 'dy': 0, 'head': None}
         idx = frame['index']
         if idx <= self.last_index:
             return dict(result, reason='duplicate_or_reordered')
         self.last_index = idx
-        age = frame['pts_to_coords_ms'] + queue_age_ms
+        age = frame['pts_to_coords_ms'] + queue_age_ms if age_ms is None else age_ms
         if not math.isfinite(age) or age < 0 or age > c.max_age_ms:
             self.reset()
             return dict(result, reason='stale')
@@ -85,5 +91,4 @@ class Controller:
         dy = max(-c.max_step,min(c.max_step,dy))
         if dx == 0 and dy == 0:
             return dict(result,reason='aligned')
-        self.last_move = now
         return dict(result,reason='move',dx=dx,dy=dy)
